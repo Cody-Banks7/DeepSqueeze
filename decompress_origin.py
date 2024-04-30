@@ -4,8 +4,8 @@ import logging
 import torch
 import numpy as np
 
-from deep_squeeze.disk_storing import load_files
-from deep_squeeze.materialization import codes_to_table
+from deep_squeeze.disk_storing_origin import load_files
+from deep_squeeze.materialization_origin import codes_to_table
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s | %(asctime)s | %(message)s',
                     datefmt='%m/%d/%Y %I:%M:%S')
@@ -19,17 +19,19 @@ if __name__ == '__main__':
     args = parser.parse_args()
     comp_file = args.input
 
-    tree, codes, failures, scaler, err_thr = load_files(comp_file)
+    model, codes, failures, scaler, err_thr = load_files(comp_file)
 
     # If a CUDA enabled GPU exists, send both the codes and the model
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Running with: {device}")
+    model.to(device)
     codes = torch.from_numpy(codes).to(device)
 
     # Get a numpy array of the model_recons + failures
     print(">>> Getting reconstructions from codes...", end='')
-    decompressed_arr = codes_to_table(tree, codes, failures, err_thr)
+    decompressed_arr = codes_to_table(model, codes, failures, err_thr)
     print("Done")
+
     # Invert the minmax scaling
     print(">>> Inverting the minmax scaling...", end='')
     rescaled_arr = scaler.inverse_transform(decompressed_arr)

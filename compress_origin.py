@@ -12,26 +12,16 @@ from datetime import datetime
 from deep_squeeze.autoencoder import AutoEncoder
 from deep_squeeze.preprocessing import ds_preprocessing
 from deep_squeeze.train_loop import train
-from deep_squeeze.materialization import materialize, materialize_with_post_binning, \
+from deep_squeeze.materialization_origin import materialize, materialize_with_post_binning, \
     materialize_with_bin_difference
-from deep_squeeze.disk_storing import store_on_disk, calculate_compression_ratio
+from deep_squeeze.disk_storing_origin import store_on_disk, calculate_compression_ratio
 from deep_squeeze.experiment import repeat_n_times, display_compression_results, run_full_experiments, \
     run_scaling_experiment, baseline_compression_ratios
 from deep_squeeze.bayesian_optimizer import minimize_comp_ratio
-from deep_squeeze.TreeStructure import TreeStructure
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s | %(asctime)s | %(message)s',
                     datefmt='%m/%d/%Y %I:%M:%S')
 compression_repeats = 1
-
-
-def train_and_encode(model, data, device, params):
-    data_tensor = torch.tensor(data, dtype=torch.float32).to(device)
-    model, loss = train(model, device, data_tensor, epochs=params['epochs'],
-                        batch_size=data.shape[0] // params['batch_size'], lr=params['lr'])
-    model.eval()
-    encoded_output = model.encoder(data_tensor).detach().cpu().numpy()
-    return model, encoded_output
 
 
 @repeat_n_times(n=compression_repeats)  # To produce a consistent result we repeat the experiment n times
@@ -59,55 +49,48 @@ def compression_pipeline(params):
     raw_table = np.array(pd.read_csv(params['data_path'], header=None))
     raw_table = raw_table[:, 0:3]
     quantized, scaler = ds_preprocessing(raw_table, params['error_threshold'], min_val=0, max_val=1)
+    corr_matrix = np.corrcoef(quantized, rowvar=False)
+
     params['features'] = quantized.shape[1]  # Need to store feature number for decompression
     logging.debug("Done\n")
-    tree = TreeStructure()
-    initial_input = quantized[:, 0:2]
-    initial_ae = AutoEncoder(initial_input.shape[1], params['code_size'], params['width_multiplier'],
-                             params['ae_depth'])
-    initial_ae.to(device)
-    tree.add_node('node_1', initial_ae)
-
-    # Train the first autoencoder with the first two columns and save its decoder state
-    model, initial_encoded_output = train_and_encode(initial_ae, initial_input, device, params)
-    tree.save_decoder_state('node_1')
-    previous_output = initial_encoded_output
-    previous_node_id = 'node_1'
-    # Sequentially add and train autoencoders for each new column
-    for i in range(2, quantized.shape[1]):
-        new_input = np.hstack((previous_output, quantized[:, i:i + 1]))  # Combine previous output with the new column
-        ae = AutoEncoder(new_input.shape[1], params['code_size'], params['width_multiplier'], params['ae_depth'])
-        ae.to(device)
-        node_id = f'node_{i}'
-        tree.add_node(node_id, ae, parent_id=previous_node_id)
-        model, encoded_output = train_and_encode(ae, new_input, device, params)
-        tree.save_decoder_state(node_id)
-
-        previous_output = encoded_output
-        previous_node_id = node_id
 
     # Create the model and send it to the GPU (if a GPU exists)
     logging.debug("Creating model...")
+    ae = AutoEncoder(quantized.shape[1], params['code_size'], params['width_multiplier'], params['ae_depth'])
+    ae.to(device)
+    logging.debug("Done\n")
+
+    # If the dataset is too big we must first sample it
+    # Of course at the end we compress the whole file and not just the sample
+    sample_data_size = int(min([params['sample_max_size'], len(quantized)]))
+    sample_data_inds = np.random.choice(len(quantized), sample_data_size, replace=False)
+    sample_data = quantized[sample_data_inds, :]
 
     # Train the autoencoder
     logging.debug("Training...")
+    model, loss = train(ae, device, sample_data, epochs=params['epochs'],
+                        batch_size=sample_data.shape[0] // params['batch_size'], lr=params['lr'])
+    logging.debug(f"Training finished. Final loss: {float(loss):.3f}")
+
+    # Set the model to eval mode
+    model.eval()
 
     # Materialization step
     if params['binning_strategy'] == "POST_BINNING":
-        codes, failures = materialize_with_post_binning(tree, quantized, device, params['error_threshold'])
+        codes, failures = materialize_with_post_binning(model, quantized, device, params['error_threshold'])
     elif params['binning_strategy'] == "BIN_DIFFERENCE":
-        codes, failures = materialize_with_bin_difference(tree, quantized, device, params['error_threshold'])
+        codes, failures = materialize_with_bin_difference(model, quantized, device, params['error_threshold'])
     elif params['binning_strategy'] == "NONE":
-        codes, failures = materialize(tree, quantized, device)
+        codes, failures = materialize(model, quantized, device)
     else:
         raise ValueError("Available binning strategies: \"NONE\", "
                          "\"POST_BINNING\", \"BIN_DIFFERENCE\"")
 
     # Store the final file on disk
-    comp_path = store_on_disk(params['compression_path'], tree, codes, failures, scaler, params)
+    comp_path = store_on_disk(params['compression_path'], model, codes, failures, scaler, params)
 
     total_time = time.time() - start_time
-    print(total_time)
+
     # Log the final compression ratio DeepSqueeze achieved
     comp_ratio, comp_size, orig_size = calculate_compression_ratio(params['data_path'], comp_path)
     logging.debug(
@@ -120,7 +103,7 @@ def compression_pipeline(params):
 if __name__ == '__main__':
     params = {
         "epochs": 1,
-        "ae_depth": 2,  # Value in paper: 2
+        "ae_depth": 3,  # Value in paper: 2
         "width_multiplier": 2,  # Value in paper: 2
         "batch_size": [1_000, 2_000],  # Optimized through bayesian optimization
         "lr": 1e-4,

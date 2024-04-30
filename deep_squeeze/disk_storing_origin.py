@@ -12,9 +12,9 @@ import zipfile
 import json
 
 from deep_squeeze.autoencoder import AutoEncoder
-from deep_squeeze.TreeStructure import TreeStructure
 
-def store_on_disk(path, tree, codes, failures, scaler, hyper_params):
+
+def store_on_disk(path, model, codes, failures, scaler, hyper_params):
     """
     Our goal is to compress a file as much as possible meaning that our final evaluation
     will be the size of the final file.
@@ -35,19 +35,13 @@ def store_on_disk(path, tree, codes, failures, scaler, hyper_params):
     Path(path).mkdir(parents=True, exist_ok=False)
 
     # Get the state dict of the model
-    for node_id, node in tree.nodes.items():
-        decoder_path = path + f"{node_id}_decoder.pth"
-        torch.save(node['autoencoder'].decoder.state_dict(), decoder_path)
+    torch.save(model.state_dict(), path + "model.pth")
 
     # Store the codes in a parquet file
     parquet_compress(codes, path, name="codes")
 
     # Store the failures in a parquet file
-    # for index, failure_data in enumerate(failures):
-    #     parquet_compress(failure_data, path, name=f"{index}_failures")
-    failures_array = np.column_stack(failures)
-    # failures_tensor = torch.from_numpy(failures_array)
-    parquet_compress(failures_array,path, name="failures")
+    parquet_compress(failures, path, name="failures")
 
     # Store the scaler
     joblib.dump(scaler, path + 'scaler.pkl')
@@ -92,33 +86,12 @@ def unzip_file(path):
     return hyper_params, temp_path
 
 
-# def load_model(folder_path, model):
-#     model.load_state_dict(torch.load(f"{folder_path}/model.pth"))
-#     model.eval()
-#
-#     return model
-def load_models(folder_path, hyper_params):
-    """
-    Load all models (autoencoders) for each stage from saved state dictionaries.
-    """
-    tree = TreeStructure()
-    model_num = hyper_params['features']
-    # Setup initial conditions for the loop
-    parent_node_id = None
-    for i in range(model_num - 1, 0, -1):
-        current_node_id = f'node_{i}'
-        ae = AutoEncoder(2, hyper_params['code_size'], hyper_params['width_multiplier'], hyper_params['ae_depth'])
-        tree.add_node(current_node_id, ae, parent_id=parent_node_id)
-        model_path = f"{folder_path}/{current_node_id}_decoder.pth"
-        if os.path.exists(model_path):
-            ae.decoder.load_state_dict(torch.load(model_path))
-            ae.decoder.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-            ae.decoder.eval()
-        else:
-            print(f"No model file found for {current_node_id}, stopping the tree construction.")
-            break  # Stop if no model file is found for the current node
-        parent_node_id = current_node_id
-    return tree
+def load_model(folder_path, model):
+    model.load_state_dict(torch.load(f"{folder_path}/model.pth"))
+    model.eval()
+
+    return model
+
 
 def load_codes_failures(folder_path):
     codes = np.array(pd.read_parquet(f"{folder_path}/codes.parquet"))
@@ -135,12 +108,16 @@ def load_files(comp_path):
     # Unzip the file and load the hyper parameters
     hyper_params, folder_path = unzip_file(comp_path)
 
+    # Initialize an autoencoder that we will load the parameters into
+    ae = AutoEncoder(hyper_params['features'], hyper_params['code_size'],
+                     hyper_params['width_multiplier'], hyper_params['ae_depth'])
+
     # Load model, codes, failures and scaler
-    tree = load_models(folder_path, hyper_params)
+    ae = load_model(folder_path, ae)
     codes, failures = load_codes_failures(folder_path)
     scaler = load_scaler(folder_path)
 
     # Since we have loaded everything we need, delete the temp folder
     shutil.rmtree(folder_path + "/")
 
-    return tree, codes, failures, scaler, hyper_params['error_threshold']
+    return ae, codes, failures, scaler, hyper_params['error_threshold']
